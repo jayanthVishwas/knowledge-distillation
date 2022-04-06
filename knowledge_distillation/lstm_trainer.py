@@ -3,10 +3,11 @@
 from __future__ import unicode_literals, print_function
 
 import os
-
+from pdb import set_trace as dp
 import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import TensorDataset, RandomSampler, DataLoader, SequentialSampler
+import torchtext
 from torchtext import data
 from tqdm import tqdm
 
@@ -40,13 +41,13 @@ class _LSTMBase(Trainer):
         return text, bert_prob, real_label
 
     def train(self, X, y, y_real, output_dir):
-
+        
         X_split = [normalize(t.split()) for t in X]
 
         split_arrays = train_test_split(X_split, y, y_real, test_size=self.settings['test_size'], stratify=y_real)
         X_train, X_test, y_train, y_test, y_real_train, y_real_test = split_arrays
 
-        text_field = data.Field()
+        text_field = torchtext.data.Field()
         text_field.build_vocab(X_train, max_size=10000)
 
         # pad
@@ -86,11 +87,13 @@ class _LSTMBase(Trainer):
         num_train_epochs = train_settings['num_train_epochs']
 
         best_eval_loss = 100000
+        acc=0
 
         for epoch in range(num_train_epochs):
             train_loss = self.epoch_train_func(model, train_dataset)
-            eval_loss, acc = self.epoch_evaluate_func(model, val_dataset, epoch)
-            self.log_epoch(train_loss, eval_loss, acc, epoch)
+            eval_loss,cosine_sim = self.epoch_evaluate_func(model, val_dataset, epoch)
+            
+            self.log_epoch(train_loss, eval_loss,cosine_sim,epoch)
 
             if eval_loss < best_eval_loss:
                 best_eval_loss = eval_loss
@@ -106,7 +109,7 @@ class _LSTMBase(Trainer):
 
         p_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
         self.logger.info('# of trainable params {}'.format(p_count))
-
+        
         num_examples = 0
         optimizer, scheduler = self.optimizer(model)
         for i, (text, bert_prob, real_label) in enumerate(tqdm(data_loader, desc='Train')):
@@ -133,6 +136,7 @@ class _LSTMBase(Trainer):
         model.eval()
         predictions = None
         labels = None
+
         for i, (text, bert_prob, real_label) in enumerate(tqdm(data_loader, desc='Val')):
             text, bert_prob, real_label = self.to_device(text, bert_prob, real_label)
             output = model(text.t()).squeeze(1)
@@ -140,15 +144,17 @@ class _LSTMBase(Trainer):
             loss = self.loss(output, bert_prob, real_label)
             eval_loss += loss.item()
 
-            probs = torch.softmax(output, dim=1)
-            pred_label = torch.argmax(probs, dim=1)
-            acc += torch.sum(pred_label == real_label).cpu().numpy()
-            num_examples += len(real_label)
+            # probs = torch.softmax(output, dim=1)
+            # pred_label = torch.argmax(probs, dim=1)
+            # acc += torch.sum(output == real_label).cpu().numpy()
+            num_examples+= len(real_label)
+            cosine_sim = torch.nn.functional.cosine_similarity(output,bert_prob).sum()/len(real_label)
+            
+            
+            # predictions, labels = self.stack(predictions, labels, probs, real_label)
 
-            predictions, labels = self.stack(predictions, labels, probs, real_label)
-
-        self.log_pr(labels, predictions, epoch)
-        return eval_loss / num_examples, acc / num_examples
+        # self.log_pr(labels, predictions, epoch)
+        return eval_loss / num_examples, cosine_sim
 
     def loss(self, output, bert_prob, real_label):
         raise NotImplementedError()
@@ -196,15 +202,19 @@ class LSTMDistilled(_LSTMBase):
         self.criterion_ce = torch.nn.CrossEntropyLoss()
         self.a = 0.5
 
-    def loss(self, output, bert_prob, real_label):
-        return self.a * self.criterion_ce(output, real_label) + (1 - self.a) * self.criterion_mse(output, bert_prob)
+    # def loss(self, output, bert_prob, real_label):
+    #     return self.a * self.criterion_ce(output, real_label) + (1 - self.a) * self.criterion_mse(output, bert_prob)
+
+    def loss(self, output, bert_prob,real_label):
+
+        return self.criterion_mse(output, bert_prob)
 
     def model(self, text_field):
         model = SimpleLSTM(
             input_dim=len(text_field.vocab),
-            embedding_dim=16,
-            hidden_dim=8,
-            output_dim=2,
+            embedding_dim=64,
+            hidden_dim=500,
+            output_dim=384,
             n_layers=1,
             bidirectional=True,
             dropout=0.5,
